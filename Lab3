@@ -1,0 +1,548 @@
+# -*- coding: utf-8 -*-
+import os
+import sys
+import json
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, count, sum as spark_sum, year, month, hour, to_timestamp, expr
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DoubleType
+
+sys.stdout.reconfigure(encoding='utf-8')
+
+
+os.environ["PYSPARK_PYTHON"] = r"D:\pyspark\env3\Scripts\python.exe"
+os.environ["PYSPARK_DRIVER_PYTHON"] = r"D:\pyspark\env3\Scripts\python.exe"
+
+
+spark = SparkSession.builder \
+    .appName("AccidentsAnalysis_Bryansk") \
+    .master("local[*]") \
+    .config("spark.driver.memory", "8g") \
+    .config("spark.sql.execution.arrow.pyspark.enabled", "true") \
+    .getOrCreate()
+
+
+sns.set_style("whitegrid")
+plt.rcParams['figure.figsize'] = (12, 6)
+plt.rcParams['font.size'] = 12
+
+
+current_dir = os.path.dirname(os.path.abspath(__file__))
+file_path = os.path.join(current_dir, "brianskaia-oblast.geojson")
+
+print("="*60)
+print("АНАЛИЗ ДТП БРЯНСКОЙ ОБЛАСТИ")
+print("="*60)
+print(f"Файл: {file_path}")
+
+
+print("\nЗагрузка данных...")
+with open(file_path, 'r', encoding='utf-8') as f:
+    geojson_data = json.load(f)
+
+features = geojson_data['features']
+print(f"Найдено записей: {len(features)}")
+
+
+all_data = []
+
+for i, feature in enumerate(features):
+    if 'properties' in feature:
+        props = feature['properties']
+        
+        
+        latitude = None
+        longitude = None
+        if 'point' in props and props['point']:
+            point = props['point']
+            if 'lat' in point:
+                latitude = point['lat']
+            if 'long' in point:
+                longitude = point['long']
+        
+        
+        record = {
+            'id': props.get('id'),
+            'severity': props.get('severity'),
+            'category': props.get('category'),
+            'datetime': props.get('datetime'),
+            'parent_region': props.get('parent_region'),
+            'region': props.get('region'),
+            'address': props.get('address'),
+            'light': props.get('light'),
+            'dead_count': props.get('dead_count', 0),
+            'injured_count': props.get('injured_count', 0),
+            'participants_count': props.get('participants_count', 0),
+            'latitude': latitude,
+            'longitude': longitude,
+            
+            
+            'weather': str(props.get('weather', [])),
+            'road_conditions': str(props.get('road_conditions', [])),
+            'vehicles': str(props.get('vehicles', []))
+        }
+        
+        all_data.append(record)
+    
+    
+    if i % 2000 == 0 and i > 0:
+        print(f"Обработано {i} записей...")
+
+
+df = spark.createDataFrame(all_data)
+df.createOrReplaceTempView("accidents")
+
+print(f"\nЗагружено записей в DataFrame: {df.count()}")
+
+
+print("\n" + "="*60)
+print("ПРОВЕРКА ДАННЫХ")
+print("="*60)
+
+region_check = spark.sql("""
+    SELECT DISTINCT parent_region 
+    FROM accidents 
+    LIMIT 5
+""")
+print("Регионы в данных:")
+region_check.show(truncate=False)
+
+
+print(f"\nАнализ для: Брянская область")
+region_condition = "parent_region = 'Брянская область'"
+
+
+def save_plot(fig, filename):
+    """Сохраняет график в файл"""
+    try:
+        fig.savefig(filename, dpi=150, bbox_inches='tight')
+        print(f"✓ График сохранен: {filename}")
+        plt.close(fig)
+    except Exception as e:
+        print(f"✗ Ошибка при сохранении {filename}: {e}")
+
+print("\n" + "="*60)
+print("УПРАЖНЕНИЕ 1: Распределение ДТП по тяжести")
+print("="*60)
+
+query1 = f"""
+SELECT 
+    COALESCE(severity, 'Не указано') as severity,
+    COUNT(*) as accidents_count,
+    SUM(COALESCE(dead_count, 0)) as total_dead,
+    SUM(COALESCE(injured_count, 0)) as total_injured,
+    ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 2) as percentage
+FROM accidents
+WHERE {region_condition}
+GROUP BY severity
+ORDER BY accidents_count DESC
+"""
+
+result1 = spark.sql(query1)
+print("Распределение ДТП по тяжести:")
+result1.show()
+
+
+result1_pd = result1.toPandas()
+result1_pd.to_csv('упражнение1_тяжесть_дтп.csv', index=False, encoding='utf-8-sig')
+print("✓ Данные сохранены в 'упражнение1_тяжесть_дтп.csv'")
+
+
+if not result1_pd.empty:
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+    
+   
+    colors = ['#66c2a5', '#fc8d62', '#8da0cb', '#e78ac3', '#a6d854']
+    bars = ax1.bar(result1_pd['severity'], result1_pd['accidents_count'], 
+                   color=colors[:len(result1_pd)], edgecolor='black')
+    ax1.set_title('Количество ДТП по степени тяжести\n(Брянская область)')
+    ax1.set_xlabel('Тяжесть ДТП')
+    ax1.set_ylabel('Количество ДТП')
+    ax1.tick_params(axis='x', rotation=45)
+    
+    
+    for bar in bars:
+        height = bar.get_height()
+        ax1.text(bar.get_x() + bar.get_width()/2., height,
+                f'{int(height):,}', ha='center', va='bottom', fontsize=10)
+    
+    
+    wedges, texts, autotexts = ax2.pie(
+        result1_pd['accidents_count'], 
+        labels=result1_pd['severity'], 
+        autopct=lambda p: f'{p:.1f}%' if p > 5 else '',
+        colors=colors[:len(result1_pd)],
+        startangle=90,
+        textprops={'fontsize': 10}
+    )
+    ax2.set_title('Доля ДТП по степени тяжести\n(Брянская область)')
+    
+    
+    for autotext in autotexts:
+        autotext.set_fontweight('bold')
+    
+    save_plot(fig, 'упражнение1_тяжесть_дтп.png')
+
+
+print("\n" + "="*60)
+print("УПРАЖНЕНИЕ 2: ДТП по времени суток")
+print("="*60)
+
+
+df_with_time = df.withColumn("datetime_ts", to_timestamp(col("datetime"), "yyyy-MM-dd HH:mm:ss")) \
+                 .withColumn("hour", hour(col("datetime_ts"))) \
+                 .withColumn("month", month(col("datetime_ts")))
+
+df_with_time.createOrReplaceTempView("accidents_with_time")
+
+query2 = f"""
+SELECT 
+    hour,
+    COUNT(*) as accidents_count,
+    SUM(COALESCE(dead_count, 0)) as total_dead,
+    SUM(COALESCE(injured_count, 0)) as total_injured
+FROM accidents_with_time
+WHERE {region_condition}
+GROUP BY hour
+ORDER BY hour
+"""
+
+result2 = spark.sql(query2)
+print("Распределение ДТП по часам суток:")
+result2.show(24)
+
+
+result2_pd = result2.toPandas()
+result2_pd.to_csv('упражнение2_дтп_по_часам.csv', index=False, encoding='utf-8-sig')
+print("✓ Данные сохранены в 'упражнение2_дтп_по_часам.csv'")
+
+
+if not result2_pd.empty:
+    
+    all_hours = pd.DataFrame({'hour': range(24)})
+    result2_full = all_hours.merge(result2_pd, on='hour', how='left').fillna({
+        'accidents_count': 0,
+        'total_dead': 0,
+        'total_injured': 0
+    })
+    
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10))
+    
+    
+    bars1 = ax1.bar(result2_full['hour'], result2_full['accidents_count'], 
+                   color='skyblue', edgecolor='black', alpha=0.8)
+    ax1.set_title('Распределение ДТП по часам суток\n(Брянская область)')
+    ax1.set_xlabel('Час суток')
+    ax1.set_ylabel('Количество ДТП')
+    ax1.set_xticks(range(0, 24))
+    ax1.grid(True, alpha=0.3, axis='y')
+    
+    
+    max_hour = result2_full.loc[result2_full['accidents_count'].idxmax()]
+    ax1.axvspan(max_hour['hour'] - 0.5, max_hour['hour'] + 0.5, 
+                alpha=0.3, color='red', label=f'Пик: {max_hour["hour"]}:00')
+    
+    
+    width = 0.35
+    x = range(len(result2_full))
+    bars2a = ax2.bar([i - width/2 for i in x], result2_full['total_injured'], 
+                     width, label='Раненые', color='lightcoral', alpha=0.8)
+    bars2b = ax2.bar([i + width/2 for i in x], result2_full['total_dead'], 
+                     width, label='Погибшие', color='darkred', alpha=0.8)
+    
+    ax2.set_title('Количество пострадавших по часам суток\n(Брянская область)')
+    ax2.set_xlabel('Час суток')
+    ax2.set_ylabel('Количество пострадавших')
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(result2_full['hour'])
+    ax2.legend()
+    ax2.grid(True, alpha=0.3, axis='y')
+    
+    
+    ax1.legend()
+    
+    plt.tight_layout()
+    save_plot(fig, 'упражнение2_дтп_по_часам.png')
+
+
+print("\n" + "="*60)
+print("УПРАЖНЕНИЕ 3: Типы ДТП")
+print("="*60)
+
+query3 = f"""
+SELECT 
+    COALESCE(category, 'Не указано') as category,
+    COUNT(*) as accidents_count,
+    SUM(COALESCE(dead_count, 0)) as total_dead,
+    SUM(COALESCE(injured_count, 0)) as total_injured,
+    ROUND(AVG(COALESCE(participants_count, 0)), 2) as avg_participants
+FROM accidents
+WHERE {region_condition}
+GROUP BY category
+ORDER BY accidents_count DESC
+LIMIT 15
+"""
+
+result3 = spark.sql(query3)
+print("Типы ДТП (топ-15 по количеству):")
+result3.show(truncate=False)
+
+
+result3_pd = result3.toPandas()
+result3_pd.to_csv('упражнение3_типы_дтп.csv', index=False, encoding='utf-8-sig')
+print("✓ Данные сохранены в 'упражнение3_типы_дтп.csv'")
+
+
+if not result3_pd.empty:
+    fig, ax = plt.subplots(figsize=(14, 8))
+    
+    
+    x = range(len(result3_pd))
+    width = 0.35
+    
+    
+    bars1 = ax.bar([i - width/2 for i in x], result3_pd['accidents_count'], 
+                   width, label='Количество ДТП', color='#66c2a5', edgecolor='black')
+    bars2 = ax.bar([i + width/2 for i in x], result3_pd['total_injured'], 
+                   width, label='Количество раненых', color='#fc8d62', edgecolor='black')
+    
+    ax.set_xlabel('Тип ДТП')
+    ax.set_ylabel('Количество')
+    ax.set_title('Типы ДТП и их последствия\n(Брянская область, топ-15)')
+    ax.set_xticks(x)
+    ax.set_xticklabels(result3_pd['category'], rotation=45, ha='right')
+    ax.legend(loc='upper right')
+    
+    
+    ax2 = ax.twinx()
+    line = ax2.plot(x, result3_pd['total_dead'], 'o-', linewidth=2, markersize=8, 
+                    label='Погибшие', color='darkred')
+    ax2.set_ylabel('Количество погибших', color='darkred')
+    ax2.tick_params(axis='y', labelcolor='darkred')
+    
+    
+    lines1, labels1 = ax.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax.legend(lines1 + lines2, labels1 + labels2, loc='upper right')
+    
+    
+    for bars in [bars1, bars2]:
+        for bar in bars:
+            height = bar.get_height()
+            if height > 0:
+                ax.text(bar.get_x() + bar.get_width()/2., height,
+                       f'{int(height)}', ha='center', va='bottom', fontsize=8)
+    
+    plt.tight_layout()
+    save_plot(fig, 'упражнение3_типы_дтп.png')
+
+
+print("\n" + "="*60)
+print("УПРАЖНЕНИЕ 4: ДТП по месяцам и временам года")
+print("="*60)
+
+
+df_with_season = df_with_time.withColumn(
+    "season",
+    expr("""
+        CASE 
+            WHEN month IN (12, 1, 2) THEN 'Зима'
+            WHEN month IN (3, 4, 5) THEN 'Весна'
+            WHEN month IN (6, 7, 8) THEN 'Лето'
+            WHEN month IN (9, 10, 11) THEN 'Осень'
+            ELSE 'Не определено'
+        END
+    """)
+)
+
+df_with_season.createOrReplaceTempView("accidents_with_season")
+
+query4 = f"""
+SELECT 
+    month,
+    season,
+    COUNT(*) as accidents_count,
+    SUM(COALESCE(dead_count, 0)) as total_dead,
+    SUM(COALESCE(injured_count, 0)) as total_injured,
+    ROUND(AVG(COALESCE(dead_count, 0)), 3) as death_rate_per_accident,
+    ROUND(AVG(COALESCE(injured_count, 0)), 3) as injury_rate_per_accident
+FROM accidents_with_season
+WHERE {region_condition}
+GROUP BY month, season
+ORDER BY month
+"""
+
+result4 = spark.sql(query4)
+print("Распределение ДТП по месяцам:")
+result4.show()
+
+
+result4_pd = result4.toPandas()
+result4_pd.to_csv('упражнение4_дтп_по_месяцам.csv', index=False, encoding='utf-8-sig')
+print("✓ Данные сохранены в 'упражнение4_дтп_по_месяцам.csv'")
+
+
+season_query = f"""
+SELECT 
+    season,
+    COUNT(*) as accidents_count,
+    SUM(COALESCE(dead_count, 0)) as total_dead,
+    SUM(COALESCE(injured_count, 0)) as total_injured,
+    ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 2) as percentage
+FROM accidents_with_season
+WHERE {region_condition}
+GROUP BY season
+ORDER BY accidents_count DESC
+"""
+
+season_result = spark.sql(season_query)
+print("\nДТП по временам года:")
+season_result.show()
+
+season_pd = season_result.toPandas()
+season_pd.to_csv('упражнение4_дтп_по_временам_года.csv', index=False, encoding='utf-8-sig')
+
+
+print("\n" + "="*60)
+print("УПРАЖНЕНИЕ 5: ДТП по погодным условиям")
+print("="*60)
+
+
+query5 = f"""
+SELECT 
+    CASE 
+        WHEN weather LIKE '%Ясно%' THEN 'Ясно'
+        WHEN weather LIKE '%Пасмурно%' THEN 'Пасмурно'
+        WHEN weather LIKE '%Дождь%' THEN 'Дождь'
+        WHEN weather LIKE '%Снег%' THEN 'Снег'
+        WHEN weather LIKE '%Туман%' THEN 'Туман'
+        WHEN weather = '[]' THEN 'Не указано'
+        ELSE 'Другое'
+    END as weather_condition,
+    COUNT(*) as accidents_count,
+    SUM(COALESCE(dead_count, 0)) as total_dead,
+    SUM(COALESCE(injured_count, 0)) as total_injured,
+    ROUND(AVG(COALESCE(dead_count, 0)), 3) as avg_dead_per_accident,
+    ROUND(AVG(COALESCE(injured_count, 0)), 3) as avg_injured_per_accident
+FROM accidents
+WHERE {region_condition}
+GROUP BY 
+    CASE 
+        WHEN weather LIKE '%Ясно%' THEN 'Ясно'
+        WHEN weather LIKE '%Пасмурно%' THEN 'Пасмурно'
+        WHEN weather LIKE '%Дождь%' THEN 'Дождь'
+        WHEN weather LIKE '%Снег%' THEN 'Снег'
+        WHEN weather LIKE '%Туман%' THEN 'Туман'
+        WHEN weather = '[]' THEN 'Не указано'
+        ELSE 'Другое'
+    END
+ORDER BY accidents_count DESC
+"""
+
+result5 = spark.sql(query5)
+print("ДТП по погодным условиям:")
+result5.show()
+
+result5_pd = result5.toPandas()
+result5_pd.to_csv('упражнение5_дтп_по_погоде.csv', index=False, encoding='utf-8-sig')
+print("✓ Данные сохранены в 'упражнение5_дтп_по_погоде.csv'")
+
+if not result5_pd.empty:
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+    
+    
+    bars1 = ax1.barh(result5_pd['weather_condition'], result5_pd['accidents_count'], 
+                     color='lightblue', edgecolor='black')
+    ax1.set_xlabel('Количество ДТП')
+    ax1.set_ylabel('Погодные условия')
+    ax1.set_title('Количество ДТП по погодным условиям\n(Брянская область)')
+    ax1.invert_yaxis() 
+    
+   
+    for bar in bars1:
+        width = bar.get_width()
+        ax1.text(width, bar.get_y() + bar.get_height()/2,
+                f'{int(width):,}', ha='left', va='center', fontsize=10)
+    
+    
+    x = range(len(result5_pd))
+    width = 0.35
+    bars2a = ax2.bar([i - width/2 for i in x], result5_pd['avg_dead_per_accident'], 
+                     width, label='Ср. погибшие на ДТП', color='darkred', alpha=0.7)
+    bars2b = ax2.bar([i + width/2 for i in x], result5_pd['avg_injured_per_accident'], 
+                     width, label='Ср. раненые на ДТП', color='orange', alpha=0.7)
+    
+    ax2.set_xlabel('Погодные условия')
+    ax2.set_ylabel('Среднее количество на одно ДТП')
+    ax2.set_title('Среднее количество пострадавших по погоде\n(Брянская область)')
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(result5_pd['weather_condition'], rotation=45, ha='right')
+    ax2.legend()
+    
+    
+    for bars in [bars2a, bars2b]:
+        for bar in bars:
+            height = bar.get_height()
+            if height > 0:
+                ax2.text(bar.get_x() + bar.get_width()/2., height,
+                        f'{height:.2f}', ha='center', va='bottom', fontsize=8)
+    
+    plt.tight_layout()
+    save_plot(fig, 'упражнение5_дтп_по_погоде.png')
+
+
+print("\n" + "="*60)
+print("СВОДНАЯ СТАТИСТИКА")
+print("="*60)
+
+summary_query = f"""
+SELECT 
+    COUNT(*) as total_accidents,
+    SUM(COALESCE(dead_count, 0)) as total_dead,
+    SUM(COALESCE(injured_count, 0)) as total_injured,
+    ROUND(AVG(COALESCE(dead_count, 0)), 3) as avg_dead_per_accident,
+    ROUND(AVG(COALESCE(injured_count, 0)), 3) as avg_injured_per_accident,
+    ROUND(AVG(COALESCE(participants_count, 0)), 2) as avg_participants,
+    COUNT(DISTINCT region) as districts_count,
+    MIN(year(datetime_ts)) as first_year,
+    MAX(year(datetime_ts)) as last_year
+FROM accidents_with_season
+WHERE {region_condition}
+"""
+
+summary = spark.sql(summary_query)
+print("Общая статистика по Брянской области:")
+summary.show(truncate=False)
+
+
+summary_pd = summary.toPandas()
+summary_pd.to_csv('сводная_статистика.csv', index=False, encoding='utf-8-sig')
+print("✓ Сводная статистика сохранена в 'сводная_статистика.csv'")
+
+
+spark.stop()
+
+print("\n" + "="*60)
+print("АНАЛИЗ ЗАВЕРШЕН УСПЕШНО!")
+print("="*60)
+print("\nСозданные файлы:")
+print("\nГРАФИКИ (PNG):")
+print("1. упражнение1_тяжесть_дтп.png")
+print("2. упражнение2_дтп_по_часам.png")
+print("3. упражнение3_типы_дтп.png")
+print("5. упражнение5_дтп_по_погоде.png")
+
+print("\nДАННЫЕ (CSV):")
+print("1. упражнение1_тяжесть_дтп.csv")
+print("2. упражнение2_дтп_по_часам.csv")
+print("3. упражнение3_типы_дтп.csv")
+print("4. упражнение4_дтп_по_месяцам.csv")
+print("5. упражнение4_дтп_по_временам_года.csv")
+print("6. упражнение5_дтп_по_погоде.csv")
+print("7. сводная_статистика.csv")
+
+print("\n" + "="*60)
+print("Все файлы сохранены в текущей папке.")
+print("="*60)
